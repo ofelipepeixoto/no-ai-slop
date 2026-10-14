@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -14,6 +16,21 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
 DIST = ROOT / "dist"
 SKILL_ROOT = ROOT / "skills" / "no-ai-slop"
+PACKAGE_SOURCES = {
+    ".codex-plugin/plugin.json": MANIFEST,
+    "assets/no-ai-slop.png": ROOT / "assets" / "no-ai-slop.png",
+    "skills/no-ai-slop/SKILL.md": SKILL_ROOT / "SKILL.md",
+    "skills/no-ai-slop/eval.md": SKILL_ROOT / "eval.md",
+    "LICENSE": ROOT / "LICENSE",
+    "PRIVACY.md": ROOT / "PRIVACY.md",
+    "TERMS.md": ROOT / "TERMS.md",
+}
+SEMVER = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,13 +39,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def require_text(value: object, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{field} must be a non-empty string")
+
+
 def validate_source(manifest: dict) -> None:
+    if not isinstance(manifest, dict):
+        raise SystemExit("Manifest must be an object")
     required = ("name", "version", "description", "author", "skills", "interface")
     missing = [key for key in required if not manifest.get(key)]
     if missing:
         raise SystemExit(f"Missing manifest fields: {', '.join(missing)}")
 
+    for field in ("name", "version", "description", "skills"):
+        require_text(manifest[field], field)
+    if manifest["name"] != "no-ai-slop" or manifest["skills"] != "./skills/":
+        raise SystemExit("Manifest name and skills must match the canonical package")
+    if len(manifest["version"]) > 64 or not SEMVER.fullmatch(manifest["version"]):
+        raise SystemExit("Version must be a safe semantic version of at most 64 characters")
+    if not isinstance(manifest["author"], dict):
+        raise SystemExit("author must be an object")
+    for field in ("name", "url"):
+        require_text(manifest["author"].get(field), f"author.{field}")
+
     interface = manifest["interface"]
+    if not isinstance(interface, dict):
+        raise SystemExit("interface must be an object")
     interface_required = (
         "displayName",
         "shortDescription",
@@ -41,54 +78,55 @@ def validate_source(manifest: dict) -> None:
     missing_interface = [key for key in interface_required if not interface.get(key)]
     if missing_interface:
         raise SystemExit(f"Missing interface fields: {', '.join(missing_interface)}")
+    for field in interface_required:
+        if field not in ("capabilities", "defaultPrompt"):
+            require_text(interface[field], f"interface.{field}")
+    capabilities = interface["capabilities"]
+    if not isinstance(capabilities, list) or not capabilities:
+        raise SystemExit("interface.capabilities must be a non-empty list")
+    for capability in capabilities:
+        require_text(capability, "interface.capabilities entry")
+    for field in ("composerIcon", "logo"):
+        if interface.get(field) != "./assets/no-ai-slop.png":
+            raise SystemExit(f"interface.{field} must reference the packaged logo")
 
     prompts = interface["defaultPrompt"]
-    if len(prompts) > 3 or any(len(prompt) > 128 for prompt in prompts):
+    if not isinstance(prompts, list) or not 1 <= len(prompts) <= 3:
+        raise SystemExit("Starter prompts must contain one to three string entries")
+    for prompt in prompts:
+        require_text(prompt, "Starter prompt")
+    if any(len(prompt) > 128 for prompt in prompts):
         raise SystemExit("Starter prompts must contain at most three entries of 128 characters or fewer")
 
-    for source in (SKILL_ROOT / "SKILL.md", SKILL_ROOT / "eval.md", ROOT / "assets" / "no-ai-slop.png"):
-        if not source.is_file():
+    for source in PACKAGE_SOURCES.values():
+        if not source.is_file() or not source.resolve().is_relative_to(ROOT.resolve()):
             raise SystemExit(f"Missing package source: {source.relative_to(ROOT)}")
 
 
-def build_plugin(manifest: dict) -> tuple[Path, Path]:
-    plugin_root = DIST / "no-ai-slop"
+def build_plugin(manifest: dict, dist: Path = DIST) -> tuple[Path, Path]:
+    if dist.is_symlink():
+        raise SystemExit("Build directory must not be a symbolic link")
+    plugin_root = dist / "no-ai-slop"
     if plugin_root.exists():
         shutil.rmtree(plugin_root)
 
-    skill_root = plugin_root / "skills" / "no-ai-slop"
-    (plugin_root / ".codex-plugin").mkdir(parents=True)
-    (plugin_root / "assets").mkdir(parents=True)
-    skill_root.mkdir(parents=True)
+    for relative, source in PACKAGE_SOURCES.items():
+        target = plugin_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
-    shutil.copy2(MANIFEST, plugin_root / ".codex-plugin" / "plugin.json")
-    shutil.copy2(SKILL_ROOT / "SKILL.md", skill_root / "SKILL.md")
-    shutil.copy2(SKILL_ROOT / "eval.md", skill_root / "eval.md")
-    shutil.copy2(ROOT / "assets" / "no-ai-slop.png", plugin_root / "assets" / "no-ai-slop.png")
-    shutil.copy2(ROOT / "LICENSE", plugin_root / "LICENSE")
-    shutil.copy2(ROOT / "PRIVACY.md", plugin_root / "PRIVACY.md")
-    shutil.copy2(ROOT / "TERMS.md", plugin_root / "TERMS.md")
-
-    archive = DIST / f"no-ai-slop-plugin-{manifest['version']}.zip"
+    archive = dist / f"no-ai-slop-plugin-{manifest['version']}.zip"
     if archive.exists():
         archive.unlink()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
         for path in sorted(plugin_root.rglob("*")):
             if path.is_file():
-                output.write(path, path.relative_to(DIST))
+                output.write(path, path.relative_to(dist))
     return plugin_root, archive
 
 
 def validate_build(plugin_root: Path, archive: Path) -> None:
-    expected = {
-        ".codex-plugin/plugin.json",
-        "assets/no-ai-slop.png",
-        "skills/no-ai-slop/SKILL.md",
-        "skills/no-ai-slop/eval.md",
-        "LICENSE",
-        "PRIVACY.md",
-        "TERMS.md",
-    }
+    expected = set(PACKAGE_SOURCES)
     actual = {
         str(path.relative_to(plugin_root))
         for path in plugin_root.rglob("*")
@@ -97,30 +135,36 @@ def validate_build(plugin_root: Path, archive: Path) -> None:
     if expected != actual:
         raise SystemExit(f"Unexpected package files: expected {sorted(expected)}, found {sorted(actual)}")
 
-    packaged_skill = plugin_root / "skills" / "no-ai-slop" / "SKILL.md"
-    packaged_eval = plugin_root / "skills" / "no-ai-slop" / "eval.md"
-    if packaged_skill.read_bytes() != (SKILL_ROOT / "SKILL.md").read_bytes():
-        raise SystemExit("Packaged SKILL.md does not match the canonical file")
-    if packaged_eval.read_bytes() != (SKILL_ROOT / "eval.md").read_bytes():
-        raise SystemExit("Packaged eval.md does not match the canonical file")
+    for relative, source in PACKAGE_SOURCES.items():
+        if (plugin_root / relative).read_bytes() != source.read_bytes():
+            raise SystemExit(f"Packaged {relative} does not match the canonical file")
     if not zipfile.is_zipfile(archive):
         raise SystemExit("Plugin archive is not a valid ZIP file")
+    with zipfile.ZipFile(archive) as package:
+        expected_members = {f"no-ai-slop/{relative}" for relative in expected}
+        members = package.namelist()
+        if len(members) != len(expected_members) or set(members) != expected_members:
+            raise SystemExit("Plugin archive contains unexpected or duplicate members")
+        if package.testzip() is not None:
+            raise SystemExit("Plugin archive contains corrupt data")
+        for relative, source in PACKAGE_SOURCES.items():
+            if package.read(f"no-ai-slop/{relative}") != source.read_bytes():
+                raise SystemExit(f"Archive {relative} does not match the canonical file")
 
 
 def main() -> None:
     args = parse_args()
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     validate_source(manifest)
-    plugin_root, archive = build_plugin(manifest)
-    validate_build(plugin_root, archive)
-    print(f"Built {archive.relative_to(ROOT)}")
     if args.check:
-        shutil.rmtree(plugin_root)
-        archive.unlink()
-        try:
-            DIST.rmdir()
-        except OSError:
-            pass
+        with tempfile.TemporaryDirectory(prefix="no-ai-slop-check-") as temporary:
+            plugin_root, archive = build_plugin(manifest, Path(temporary))
+            validate_build(plugin_root, archive)
+        print("Validated plugin in a temporary build directory")
+    else:
+        plugin_root, archive = build_plugin(manifest)
+        validate_build(plugin_root, archive)
+        print(f"Built {archive.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
